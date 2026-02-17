@@ -164,10 +164,10 @@ use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
-use crate::ui::screen_transition::{self, ScreenTransition};
-use crate::ui::screenshot_ui::{
-    OutputScreenshot, ScreenshotUi, ScreenshotUiMode, ScreenshotUiRenderElement,
+use crate::ui::region_selection_ui::{
+    OutputScreenshot, RegionSelectionUi, RegionSelectionUiRenderElement,
 };
+use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -182,11 +182,25 @@ use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
+const SCREENSHOT_PANEL_TEXT_HIDE_POINTER: &str =
+    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
+     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to hide the pointer.";
+const SCREENSHOT_PANEL_TEXT_SHOW_POINTER: &str =
+    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
+     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
+const DYNAMIC_CAST_REGION_PANEL_TEXT: &str =
+    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to set dynamic cast region.";
 
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+#[derive(Debug, Clone, PartialEq)]
+enum RegionSelectionPurpose {
+    Screenshot { path: Option<String> },
+    DynamicCastRegion,
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -385,7 +399,8 @@ pub struct Niri {
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
 
-    pub screenshot_ui: ScreenshotUi,
+    pub screenshot_ui: RegionSelectionUi,
+    region_selection_purpose: Option<RegionSelectionPurpose>,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
@@ -516,7 +531,7 @@ pub enum KeyboardFocus {
     Layout { surface: Option<WlSurface> },
     LayerShell { surface: WlSurface },
     LockScreen { surface: Option<WlSurface> },
-    ScreenshotUi,
+    RegionSelectionUi,
     ExitConfirmDialog,
     Overview,
     Mru,
@@ -698,7 +713,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface.as_ref(),
-            KeyboardFocus::ScreenshotUi => None,
+            KeyboardFocus::RegionSelectionUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
@@ -710,7 +725,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface,
-            KeyboardFocus::ScreenshotUi => None,
+            KeyboardFocus::RegionSelectionUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
@@ -1174,7 +1189,7 @@ impl State {
                 surface: self.niri.lock_surface_focus(),
             }
         } else if self.niri.screenshot_ui.is_open() {
-            KeyboardFocus::ScreenshotUi
+            KeyboardFocus::RegionSelectionUi
         } else if self.niri.window_mru_ui.is_open() {
             KeyboardFocus::Mru
         } else if let Some(output) = self.niri.layout.active_output() {
@@ -1978,10 +1993,18 @@ impl State {
         self.niri.output_management_state.notify_changes(new_config);
     }
 
-    fn open_region_selection_ui(&mut self, show_pointer: bool, mode: ScreenshotUiMode) {
+    fn open_region_selection_ui(
+        &mut self,
+        show_pointer: bool,
+        panel_show_pointer_text: &'static str,
+        panel_hide_pointer_text: &'static str,
+        allow_pointer_toggle: bool,
+        purpose: RegionSelectionPurpose,
+    ) {
         if self.niri.is_locked() || self.niri.screenshot_ui.is_open() {
             return;
         }
+        self.niri.region_selection_purpose = None;
 
         let default_output = self
             .niri
@@ -2010,11 +2033,24 @@ impl State {
             touch.unset_grab(self);
         }
 
-        self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, mode)
-        });
+        let Some(opened) = self.backend.with_primary_renderer(|renderer| {
+            self.niri.screenshot_ui.open(
+                renderer,
+                screenshots,
+                default_output,
+                show_pointer,
+                panel_show_pointer_text,
+                panel_hide_pointer_text,
+                allow_pointer_toggle,
+            )
+        }) else {
+            return;
+        };
+        if !opened {
+            return;
+        }
+
+        self.niri.region_selection_purpose = Some(purpose);
 
         self.niri
             .cursor_manager
@@ -2023,11 +2059,36 @@ impl State {
     }
 
     pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
-        self.open_region_selection_ui(show_pointer, ScreenshotUiMode::Screenshot { path });
+        self.open_region_selection_ui(
+            show_pointer,
+            SCREENSHOT_PANEL_TEXT_SHOW_POINTER,
+            SCREENSHOT_PANEL_TEXT_HIDE_POINTER,
+            true,
+            RegionSelectionPurpose::Screenshot { path },
+        );
     }
 
     pub fn open_dynamic_cast_region_ui(&mut self) {
-        self.open_region_selection_ui(false, ScreenshotUiMode::DynamicCastRegion);
+        self.open_region_selection_ui(
+            false,
+            DYNAMIC_CAST_REGION_PANEL_TEXT,
+            DYNAMIC_CAST_REGION_PANEL_TEXT,
+            false,
+            RegionSelectionPurpose::DynamicCastRegion,
+        );
+    }
+
+    pub fn close_region_selection_ui(&mut self) -> bool {
+        if !self.niri.screenshot_ui.close() {
+            return false;
+        }
+
+        self.niri.region_selection_purpose = None;
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+        self.niri.queue_redraw_all();
+        true
     }
 
     pub fn handle_pick_color(&mut self, tx: async_channel::Sender<Option<niri_ipc::PickedColor>>) {
@@ -2047,13 +2108,15 @@ impl State {
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
-        let mode = match &self.niri.screenshot_ui {
-            ScreenshotUi::Open { mode, .. } => mode.clone(),
-            _ => return,
+        if !self.niri.screenshot_ui.is_open() {
+            return;
+        }
+        let Some(purpose) = self.niri.region_selection_purpose.clone() else {
+            return;
         };
 
-        match mode {
-            ScreenshotUiMode::Screenshot { path } => {
+        match purpose {
+            RegionSelectionPurpose::Screenshot { path } => {
                 self.backend.with_primary_renderer(|renderer| {
                     match self.niri.screenshot_ui.capture(renderer) {
                         Ok((size, pixels)) => {
@@ -2069,7 +2132,7 @@ impl State {
                     }
                 });
             }
-            ScreenshotUiMode::DynamicCastRegion => {
+            RegionSelectionPurpose::DynamicCastRegion => {
                 if let Some((output, rect)) = self.niri.screenshot_ui.selected_region() {
                     self.set_dynamic_cast_target(CastTarget::Region {
                         output: output.downgrade(),
@@ -2080,11 +2143,7 @@ impl State {
             }
         }
 
-        self.niri.screenshot_ui.close();
-        self.niri
-            .cursor_manager
-            .set_cursor_image(CursorImageStatus::default_named());
-        self.niri.queue_redraw_all();
+        self.close_region_selection_ui();
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
@@ -2406,7 +2465,7 @@ impl Niri {
         let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds);
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
 
-        let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
+        let screenshot_ui = RegionSelectionUi::new(animation_clock.clone(), config.clone());
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
@@ -2596,6 +2655,7 @@ impl Niri {
             locked_hint: None,
 
             screenshot_ui,
+            region_selection_purpose: None,
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
@@ -2946,6 +3006,7 @@ impl Niri {
         }
 
         if self.screenshot_ui.close() {
+            self.region_selection_purpose = None;
             self.cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
             self.queue_redraw_all();
@@ -2996,6 +3057,7 @@ impl Niri {
             // physical coordinates.
             if old_size != size || old_scale != scale || old_transform != transform {
                 self.screenshot_ui.close();
+                self.region_selection_purpose = None;
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
                 self.queue_redraw_all();
@@ -3962,7 +4024,7 @@ impl Niri {
             // FIXME: when going into the screenshot UI from a layer-shell focus, and then back to
             // layer-shell, the layout will briefly draw as active, despite never having focus.
             KeyboardFocus::LockScreen { .. } => true,
-            KeyboardFocus::ScreenshotUi => true,
+            KeyboardFocus::RegionSelectionUi => true,
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Mru => true,
@@ -5565,6 +5627,7 @@ impl Niri {
         if self.output_state.is_empty() {
             // There are no outputs, lock the session right away.
             self.screenshot_ui.close();
+            self.region_selection_purpose = None;
             self.cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
 
@@ -5625,6 +5688,7 @@ impl Niri {
                 self.event_loop.remove(deadline_token);
 
                 self.screenshot_ui.close();
+                self.region_selection_purpose = None;
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
                 self.cancel_mru();
@@ -6219,7 +6283,7 @@ niri_render_elements! {
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
-        ScreenshotUi = ScreenshotUiRenderElement,
+        RegionSelectionUi = RegionSelectionUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,

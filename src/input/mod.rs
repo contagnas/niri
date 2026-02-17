@@ -50,7 +50,7 @@ use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::protocols::virtual_keyboard::VirtualKeyboard;
 use crate::ui::mru::{WindowMru, WindowMruUi};
-use crate::ui::screenshot_ui::ScreenshotUi;
+use crate::ui::region_selection_ui::RegionSelectionUi;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
@@ -751,15 +751,7 @@ impl State {
                 self.confirm_screenshot(write_to_disk);
             }
             Action::CancelScreenshot => {
-                if !self.niri.screenshot_ui.is_open() {
-                    return;
-                }
-
-                self.niri.screenshot_ui.close();
-                self.niri
-                    .cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
-                self.niri.queue_redraw_all();
+                self.close_region_selection_ui();
             }
             Action::ScreenshotTogglePointer => {
                 self.niri.screenshot_ui.toggle_pointer();
@@ -4341,7 +4333,7 @@ fn should_intercept_key<'a>(
     raw: Option<Keysym>,
     pressed: bool,
     mods: ModifiersState,
-    screenshot_ui: &ScreenshotUi,
+    screenshot_ui: &RegionSelectionUi,
     disable_power_key_handling: bool,
     is_inhibiting_shortcuts: bool,
 ) -> FilterResult<Option<Bind>> {
@@ -5112,7 +5104,7 @@ mod tests {
         let comp_mod = ModKey::Super;
         let mut suppressed_keys = HashSet::new();
 
-        let screenshot_ui = ScreenshotUi::new(Clock::default(), Default::default());
+        let screenshot_ui = RegionSelectionUi::new(Clock::default(), Default::default());
         let disable_power_key_handling = false;
         let is_inhibiting_shortcuts = Cell::new(false);
 

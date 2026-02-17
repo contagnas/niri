@@ -42,6 +42,14 @@ const TEXT_HIDE_P: &str =
 const TEXT_SHOW_P: &str =
     "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
      Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
+const TEXT_DYNAMIC_CAST_REGION: &str =
+    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to set dynamic cast region.";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenshotUiMode {
+    Screenshot { path: Option<String> },
+    DynamicCastRegion,
+}
 
 // Ideally the screenshot UI should support cross-output selections. However, that poses some
 // technical challenges when the outputs have different scales and such. So, this implementation
@@ -60,10 +68,10 @@ pub enum ScreenshotUi {
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
+        mode: ScreenshotUiMode,
         open_anim: Animation,
         clock: Clock,
         config: Rc<RefCell<Config>>,
-        path: Option<String>,
     },
 }
 
@@ -142,7 +150,7 @@ impl ScreenshotUi {
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
         default_output: Output,
         show_pointer: bool,
-        path: Option<String>,
+        mode: ScreenshotUiMode,
     ) -> bool {
         if screenshots.is_empty() {
             return false;
@@ -207,8 +215,14 @@ impl ScreenshotUi {
                         .map_err(|err| warn!("error rendering help panel: {err:?}"))
                         .ok()
                 };
-                let panel_show = render_panel_(TEXT_SHOW_P);
-                let panel_hide = render_panel_(TEXT_HIDE_P);
+                let (panel_show_text, panel_hide_text) = match &mode {
+                    ScreenshotUiMode::Screenshot { .. } => (TEXT_SHOW_P, TEXT_HIDE_P),
+                    ScreenshotUiMode::DynamicCastRegion => {
+                        (TEXT_DYNAMIC_CAST_REGION, TEXT_DYNAMIC_CAST_REGION)
+                    }
+                };
+                let panel_show = render_panel_(panel_show_text);
+                let panel_hide = render_panel_(panel_hide_text);
                 let panel = Option::zip(panel_show, panel_hide);
 
                 let data = OutputData {
@@ -234,10 +248,10 @@ impl ScreenshotUi {
             output_data,
             button: Button::Up,
             show_pointer,
+            mode,
             open_anim,
             clock: clock.clone(),
             config: config.clone(),
-            path,
         };
 
         self.update_buffers();
@@ -278,6 +292,18 @@ impl ScreenshotUi {
 
     pub fn is_open(&self) -> bool {
         matches!(self, ScreenshotUi::Open { .. })
+    }
+
+    pub fn selected_region(&self) -> Option<(Output, Rectangle<i32, Physical>)> {
+        if let Self::Open {
+            selection: (output, a, b),
+            ..
+        } = self
+        {
+            Some((output.clone(), rect_from_corner_points(*a, *b)))
+        } else {
+            None
+        }
     }
 
     pub fn set_space_down(&mut self, down: bool) {

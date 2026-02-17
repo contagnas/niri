@@ -165,7 +165,9 @@ use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderE
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
-use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::screenshot_ui::{
+    OutputScreenshot, ScreenshotUi, ScreenshotUiMode, ScreenshotUiRenderElement,
+};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -581,6 +583,13 @@ pub enum CastTarget {
         /// Cached name of the output.
         name: String,
     },
+    Region {
+        output: WeakOutput,
+        /// Cached name of the output.
+        name: String,
+        /// Region in output-local physical coordinates.
+        rect: Rectangle<i32, Physical>,
+    },
     Window {
         id: u64,
     },
@@ -595,7 +604,10 @@ impl CastTarget {
     }
 
     pub fn matches_output(&self, weak: &WeakOutput) -> bool {
-        matches!(self, CastTarget::Output { output, .. } if output == weak)
+        matches!(
+            self,
+            CastTarget::Output { output, .. } | CastTarget::Region { output, .. } if output == weak
+        )
     }
 
     pub fn matches(&self, ipc: &niri_ipc::CastTarget) -> bool {
@@ -604,6 +616,22 @@ impl CastTarget {
             (Nothing, niri_ipc::CastTarget::Nothing {}) => true,
             (Output { name, .. }, niri_ipc::CastTarget::Output { name: ipc_name }) => {
                 name == ipc_name
+            }
+            (
+                Region { name, rect, .. },
+                niri_ipc::CastTarget::Region {
+                    name: ipc_name,
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            ) => {
+                name == ipc_name
+                    && rect.loc.x == *x
+                    && rect.loc.y == *y
+                    && rect.size.w == *width
+                    && rect.size.h == *height
             }
             (Window { id }, niri_ipc::CastTarget::Window { id: ipc_id }) => id == ipc_id,
             _ => false,
@@ -615,6 +643,13 @@ impl CastTarget {
         match self {
             Nothing => niri_ipc::CastTarget::Nothing {},
             Output { name, .. } => niri_ipc::CastTarget::Output { name: name.clone() },
+            Region { name, rect, .. } => niri_ipc::CastTarget::Region {
+                name: name.clone(),
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+            },
             Window { id } => niri_ipc::CastTarget::Window { id: *id },
         }
     }
@@ -1943,7 +1978,7 @@ impl State {
         self.niri.output_management_state.notify_changes(new_config);
     }
 
-    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+    fn open_region_selection_ui(&mut self, show_pointer: bool, mode: ScreenshotUiMode) {
         if self.niri.is_locked() || self.niri.screenshot_ui.is_open() {
             return;
         }
@@ -1978,13 +2013,21 @@ impl State {
         self.backend.with_primary_renderer(|renderer| {
             self.niri
                 .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
+                .open(renderer, screenshots, default_output, show_pointer, mode)
         });
 
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
         self.niri.queue_redraw_all();
+    }
+
+    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+        self.open_region_selection_ui(show_pointer, ScreenshotUiMode::Screenshot { path });
+    }
+
+    pub fn open_dynamic_cast_region_ui(&mut self) {
+        self.open_region_selection_ui(false, ScreenshotUiMode::DynamicCastRegion);
     }
 
     pub fn handle_pick_color(&mut self, tx: async_channel::Sender<Option<niri_ipc::PickedColor>>) {
@@ -2004,23 +2047,38 @@ impl State {
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
-        let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
-            return;
+        let mode = match &self.niri.screenshot_ui {
+            ScreenshotUi::Open { mode, .. } => mode.clone(),
+            _ => return,
         };
-        let path = path.take();
 
-        self.backend.with_primary_renderer(|renderer| {
-            match self.niri.screenshot_ui.capture(renderer) {
-                Ok((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
-                        warn!("error saving screenshot: {err:?}");
+        match mode {
+            ScreenshotUiMode::Screenshot { path } => {
+                self.backend.with_primary_renderer(|renderer| {
+                    match self.niri.screenshot_ui.capture(renderer) {
+                        Ok((size, pixels)) => {
+                            if let Err(err) =
+                                self.niri.save_screenshot(size, pixels, write_to_disk, path)
+                            {
+                                warn!("error saving screenshot: {err:?}");
+                            }
+                        }
+                        Err(err) => {
+                            warn!("error capturing screenshot: {err:?}");
+                        }
                     }
-                }
-                Err(err) => {
-                    warn!("error capturing screenshot: {err:?}");
+                });
+            }
+            ScreenshotUiMode::DynamicCastRegion => {
+                if let Some((output, rect)) = self.niri.screenshot_ui.selected_region() {
+                    self.set_dynamic_cast_target(CastTarget::Region {
+                        output: output.downgrade(),
+                        name: output.name(),
+                        rect,
+                    });
                 }
             }
-        });
+        }
 
         self.niri.screenshot_ui.close();
         self.niri

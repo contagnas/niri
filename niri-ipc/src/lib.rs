@@ -896,6 +896,8 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg())]
         output: Option<String>,
     },
+    /// Set the dynamic cast target to an interactively selected screen region.
+    SetDynamicCastRegion {},
     /// Clear the dynamic cast target, making it show nothing.
     ClearDynamicCastTarget {},
     /// Stop a PipeWire screencast.
@@ -1562,6 +1564,19 @@ pub enum CastTarget {
     Window {
         /// ID of the screencasted window.
         id: u64,
+    },
+    /// Casting a region of an output.
+    Region {
+        /// Name of the screencasted output.
+        name: String,
+        /// Region X coordinate in output-local physical pixels.
+        x: i32,
+        /// Region Y coordinate in output-local physical pixels.
+        y: i32,
+        /// Region width in physical pixels.
+        width: i32,
+        /// Region height in physical pixels.
+        height: i32,
     },
 }
 

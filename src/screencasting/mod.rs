@@ -162,6 +162,12 @@ impl State {
                 }
                 return;
             }
+            CastTarget::Region { output, .. } => {
+                if let Some(output) = output.upgrade() {
+                    self.niri.queue_redraw(&output);
+                }
+                return;
+            }
             CastTarget::Window { id } => *id,
         };
 
@@ -265,6 +271,11 @@ impl State {
                     refresh = Some(output.current_mode().unwrap().refresh as u32);
                 }
             }
+            CastTarget::Region { output, .. } => {
+                if let Some(output) = output.upgrade() {
+                    refresh = Some(output.current_mode().unwrap().refresh as u32);
+                }
+            }
             CastTarget::Window { id } => {
                 let mut windows = self.niri.layout.windows();
                 if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
@@ -321,6 +332,13 @@ impl State {
                     return;
                 };
                 cast_params_for_output(&output)
+            }
+            CastTarget::Region { output, rect, .. } => {
+                let Some(output) = output.upgrade() else {
+                    return;
+                };
+                let refresh = output.current_mode().unwrap().refresh as u32;
+                (rect.size, refresh)
             }
             CastTarget::Window { id } => {
                 let Some((size, refresh)) = self.niri.cast_params_for_window(*id) else {
@@ -545,10 +563,6 @@ impl Niri {
 
         let scale = Scale::from(output.current_scale().fractional_scale());
 
-        let mut elements = Vec::new();
-        let mut pointer = Vec::new();
-        let mut cursor_data = None;
-
         let mut casts_to_stop = vec![];
 
         let mut casts = mem::take(&mut self.casting.casts);
@@ -561,7 +575,14 @@ impl Niri {
                 continue;
             }
 
-            match cast.ensure_size(size) {
+            let region = match &cast.target {
+                CastTarget::Output { .. } => None,
+                CastTarget::Region { rect, .. } => Some(rect.clone()),
+                _ => continue,
+            };
+            let cast_size = region.map_or(size, |rect| rect.size);
+
+            match cast.ensure_size(cast_size) {
                 Ok(CastSizeChange::Ready) => (),
                 Ok(CastSizeChange::Pending) => continue,
                 Err(err) => {
@@ -574,36 +595,64 @@ impl Niri {
                 continue;
             }
 
-            if cursor_data.is_none() {
+            let mut elements = Vec::new();
+            if let Some(region) = region {
+                let offset = region.loc.upscale(-1);
                 self.render_inner(
                     renderer,
                     output,
                     false,
                     RenderTarget::Screencast,
-                    &mut |elem| elements.push(elem.into()),
+                    &mut |elem| {
+                        let elem =
+                            RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
+                        elements.push(CastRenderElement::from(elem));
+                    },
                 );
+            } else {
+                self.render_inner(
+                    renderer,
+                    output,
+                    false,
+                    RenderTarget::Screencast,
+                    &mut |elem| elements.push(CastRenderElement::from(elem)),
+                );
+            }
 
-                let mut pointer_pos = Point::default();
-                if self.pointer_visibility.is_visible() {
-                    let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
-                    let pointer_loc = self
-                        .tablet_cursor_location
-                        .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
-                    // Only render when the pointer is within the output. Otherwise, it will
-                    // happily appear anywhere outside the output video source in OBS.
-                    if output_geo.contains(pointer_loc) {
-                        pointer_pos = pointer_loc - output_geo.loc;
+            let mut pointer_elements = Vec::new();
+            let mut pointer_location = Point::default();
+            if self.pointer_visibility.is_visible() {
+                let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+                let pointer_loc = self
+                    .tablet_cursor_location
+                    .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+                // Only render when the pointer is within the output. Otherwise, it will
+                // happily appear anywhere outside the output video source in OBS.
+                if output_geo.contains(pointer_loc) {
+                    pointer_location = pointer_loc - output_geo.loc;
+
+                    if let Some(region) = region {
+                        pointer_location -= region.loc.to_f64().to_logical(scale);
+
+                        let offset = region.loc.upscale(-1);
                         self.render_pointer(renderer, output, &mut |elem| {
-                            pointer.push(elem.into())
+                            let elem = RelocateRenderElement::from_element(
+                                elem,
+                                offset,
+                                Relocate::Relative,
+                            );
+                            pointer_elements.push(CastRenderElement::from(elem));
+                        });
+                    } else {
+                        self.render_pointer(renderer, output, &mut |elem| {
+                            pointer_elements.push(CastRenderElement::from(elem))
                         });
                     }
                 }
-
-                cursor_data = Some(CursorData::compute(&pointer, pointer_pos, scale));
             }
-            let cursor_data = cursor_data.as_ref().unwrap();
+            let cursor_data = CursorData::compute(&pointer_elements, pointer_location, scale);
 
-            if cast.dequeue_buffer_and_render(renderer, &elements, cursor_data, size, scale) {
+            if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, cast_size, scale) {
                 cast.last_frame_time = target_presentation_time;
             }
         }
@@ -740,7 +789,17 @@ impl Niri {
         let mut saw_dynamic = false;
         let mut ids = Vec::new();
         for cast in &self.casting.casts {
-            if cast.target != target {
+            let matches = match (&cast.target, &target) {
+                (
+                    CastTarget::Region {
+                        output: cast_output,
+                        ..
+                    },
+                    CastTarget::Output { output, .. },
+                ) => cast_output == output,
+                _ => cast.target == target,
+            };
+            if !matches {
                 continue;
             }
 
@@ -790,6 +849,7 @@ fn cast_params_for_output(output: &Output) -> (Size<i32, Physical>, u32) {
 niri_render_elements! {
     CastRenderElement<R> => {
         Output = OutputRenderElements<R>,
+        RelocatedOutput = RelocateRenderElement<OutputRenderElements<R>>,
         Window = WindowCastRenderElements<R>,
         Pointer = PointerRenderElements<R>,
         RelocatedPointer = RelocateRenderElement<PointerRenderElements<R>>,

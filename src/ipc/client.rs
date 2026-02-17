@@ -759,6 +759,15 @@ fn print_cast(cast: &Cast) {
         CastTarget::Window { id } => {
             println!("  Target: window {id}");
         }
+        CastTarget::Region {
+            name,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            println!("  Target: region {x},{y} {width}x{height} on output \"{name}\"");
+        }
     }
 
     if cast.is_dynamic_target {

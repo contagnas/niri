@@ -355,6 +355,7 @@ pub enum Action {
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
     SetDynamicCastMonitor(#[knuffel(argument)] Option<String>),
+    SetDynamicCastRegion,
     ClearDynamicCastTarget,
     #[knuffel(skip)]
     StopCast(u64),
@@ -691,6 +692,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SetDynamicCastMonitor { output } => {
                 Self::SetDynamicCastMonitor(output)
             }
+            niri_ipc::Action::SetDynamicCastRegion {} => Self::SetDynamicCastRegion,
             niri_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             niri_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,

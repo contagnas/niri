@@ -2264,6 +2264,10 @@ impl State {
                     self.set_dynamic_cast_target(CastTarget::output(output));
                 }
             }
+            Action::SetDynamicCastRegion => {
+                self.open_dynamic_cast_region_ui();
+                self.niri.cancel_mru();
+            }
             Action::ClearDynamicCastTarget => {
                 self.set_dynamic_cast_target(CastTarget::Nothing);
             }
